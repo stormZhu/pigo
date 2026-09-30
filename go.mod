@@ -1,6 +1,6 @@
 module github.com/smallnest/pigo
 
-go 1.27rc1
+go 1.26
 
 require (
 	charm.land/bubbles/v2 v2.1.1

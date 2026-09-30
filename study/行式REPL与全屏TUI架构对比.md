@@ -91,4 +91,5 @@ flowchart TD
 - 行式 REPL 驱动与主循环：[`internal/cli/repl/repl.go:runREPL`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/repl/repl.go#L248)
 - 行式 REPL 单次运行装配：[`internal/cli/repl/repl.go:streamRun`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/repl/repl.go#L593)
 - 全屏 TUI 事件桥接与驱动：[`internal/cli/tui/bridge.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go)
-- 全屏 TUI 入口：[`internal/cli/tui/tui.go:Run`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/tui.go)
+- 全屏 TUI 入口：[`internal/cli/tui/run.go:Run`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/run.go#L13-L24)
+- 延伸阅读：TUI 内部完整流程见 [全屏 TUI 事件桥与 MVU 生命周期设计](./全屏TUI事件桥与MVU生命周期设计.md)
