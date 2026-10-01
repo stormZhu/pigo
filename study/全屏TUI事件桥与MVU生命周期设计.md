@@ -1,6 +1,6 @@
 # 全屏 TUI 事件桥与 MVU 生命周期设计
 
-本笔记以 [`tui.Run`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/run.go#L13-L24) 为主线，记录全屏 TUI（`internal/cli/tui`）的完整运行流程：入口分派与门控、会话装配、Bubble Tea v2 的 MVU 主循环、把 `AgentEvent` 翻译为 `tea.Msg` 的事件桥，以及提交 → 泵 → 落盘的运行生命周期。它与 [行式 REPL 与全屏 TUI 架构对比](./行式REPL与全屏TUI架构对比.md) 互补：那篇讲「两种表现层如何共用同一内核」，本文讲「TUI 这条表现层内部怎么跑」。
+本笔记以 [`tui.Run`](../internal/cli/tui/run.go#L13-L24) 为主线，记录全屏 TUI（`internal/cli/tui`）的完整运行流程：入口分派与门控、会话装配、Bubble Tea v2 的 MVU 主循环、把 `AgentEvent` 翻译为 `tea.Msg` 的事件桥，以及提交 → 泵 → 落盘的运行生命周期。它与 [行式 REPL 与全屏 TUI 架构对比](./行式REPL与全屏TUI架构对比.md) 互补：那篇讲「两种表现层如何共用同一内核」，本文讲「TUI 这条表现层内部怎么跑」。
 
 ---
 
@@ -35,7 +35,7 @@ TUI 本质上是一台 **Bubble Tea v2 的 MVU 状态机**（Model / Update / Vi
 
 ## 二、入口分派与门控
 
-分派发生在 [`cmd/pigo/main.go` 的 dispatch](file:///Users/yuqing/Documents/workspace/pigo/cmd/pigo/main.go#L425-L481)：**没有 prompt** 时先判断 `resumeID == "" && !isTTY` 是否为使用错误（CI/管道里既无输入也无交互对象），然后 `run.SetupEnv` 装配环境，最后门控：
+分派发生在 [`cmd/pigo/main.go` 的 dispatch](../cmd/pigo/main.go#L377-L533)：**没有 prompt** 时先判断 `resumeID == "" && !isTTY` 是否为使用错误（CI/管道里既无输入也无交互对象），然后 `run.SetupEnv` 装配环境，最后门控：
 
 ```mermaid
 flowchart TD
@@ -49,7 +49,7 @@ flowchart TD
     G -->|否| I["repl.Run(repl.Options{...})"]
 ```
 
-门控函数极简（[`shouldUseTUI`](file:///Users/yuqing/Documents/workspace/pigo/cmd/pigo/main.go#L653-L655)）：
+门控函数极简（[`shouldUseTUI`](../cmd/pigo/main.go#L653-L655)）：
 
 ```go
 func shouldUseTUI(opts cliOptions, isTTY bool) bool {
@@ -59,7 +59,7 @@ func shouldUseTUI(opts cliOptions, isTTY bool) bool {
 
 两个关键点：
 
-- **两条路径吃同一份 `Options`**：[`tui.Options`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/options.go#L16-L59) 字段与 `repl.Options` 逐一对齐，dispatch 才能把同一份装配结果映射到任一路径，不需要适配层。
+- **两条路径吃同一份 `Options`**：[`tui.Options`](../internal/cli/tui/options.go#L16-L59) 字段与 `repl.Options` 逐一对齐，dispatch 才能把同一份装配结果映射到任一路径，不需要适配层。
 - **非 TTY 强制降级**：在 CI 或 `| head` 这类管道里 `isTTY` 为假，强制走 REPL，避免脚本卡在 alt-screen 里。
 
 ---
@@ -79,7 +79,7 @@ _, err = p.Run()
 
 这样设计的意图是：store 打不开或 resume 失败，应该是一个明确的启动错误，而不是进到黑屏里才发现问题。
 
-[`newRunSessionWithStore`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/session.go#L138-L295) 装配的 [`runSession`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/session.go#L45-L124) 覆盖：
+[`newRunSessionWithStore`](../internal/cli/tui/session.go#L138-L264) 装配的 [`runSession`](../internal/cli/tui/session.go#L45-L118) 覆盖：
 
 | 装配物                                          | 说明                                                |
 | :---------------------------------------------- | :-------------------------------------------------- |
@@ -90,12 +90,23 @@ _, err = p.Run()
 | `trust` / `dispatcher` / `hookDeps` / `onEvent` | 信任管理、Hook 分发器与观察者链                     |
 | `curLeaf` / `persisted` / `compacted`           | 树状会话游标与分支落盘状态                          |
 
-装配后 [`withSession`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L210-L223) 把模型的**接缝**接上：
+装配后 [`withSession`](../internal/cli/tui/model.go#L210-L223) 把模型的依赖**注入**进去：
 
 - `startRunFn = s.startRun` → 提交时真正启动一次 run
 - `interruptFn = s.interrupt` → 两段式中断的取消函数
 - `m.live = s.live` / `m.slash = s.slash` → 让 `/model` 改的是运行循环读的那份配置
 - `addBanner` + `seedTranscript(history)` → resume 时把历史回放进 transcript
+
+### 为什么是「注入」而不是直接 new
+
+`startRunFn`、`interruptFn` 在 [`Model`](../internal/cli/tui/model.go#L67-L86) 里只是**函数类型的字段**：Model 声明签名、持有调用点，但既不实现、也不 import `session` / `store` / `runtime`。真正的实现由 `runSession` 提供，`withSession` 只做赋值。这个技法就是**依赖注入 / 回调注册**（Go 社区口语叫 wiring），在 Go 里用函数值代替接口是常规手法。
+
+不直接在 Model 里 new 一个 session，换来两件事：
+
+- **可测**：[slash_test.go:184](../internal/cli/tui/slash_test.go#L184) 把 `startRunFn` 换成 stub，就能在不碰真 store、真 provider 的情况下验证 prompt 路径；[input_test.go:169](../internal/cli/tui/input_test.go#L169) 给 `interruptFn` 装一个记录器，就能断言 `ctrl+c` 触发了两段式中断。字段为 nil 时模型照样能构造（`NewModel` 之后不注入），所以「未注入」是一条**正常可走**的状态，不是崩溃。
+- **Model 不背状态**：`store`、`agentCtx`、`live`、`slash` 都属于 `runSession`，Model 只拿一个能调的函数引用，两者各自的所有权和生命周期因此保持干净。
+
+顺带把术语落到实处：**「注入」在代码层面就是一行赋值**（`m.startRunFn = s.startRun`），没有任何额外机制。之所以值得单起一个名字，是因为这行赋值同时确定了「谁拥有实现」（`runSession`）和「谁负责调用」（Model）——也正因如此，[`startPrompt`](../internal/cli/tui/model.go#L996-L1008) 里才需要 `startRunFn == nil` 这个分支（见[第七节](#七一次提交的完整生命周期)流程图中的 `startRunFn 是否已注入?`）。
 
 ---
 
@@ -103,9 +114,9 @@ _, err = p.Run()
 
 标准 Bubble Tea 三件套，职责边界清晰：
 
-- [`Init`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L228-L232)：拉起异步 git 探测、聚焦输入框、请求终端背景色。alt-screen 不在 `Init` 里开，而是通过 `View` 返回值声明。
-- [`Update`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L238-L547)：唯一的纯状态迁移入口，一个大 `type switch` 分派所有 `tea.Msg`。
-- [`View`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1186-L1198)：渲染，并声明 `AltScreen: true` 与 `MouseMode: tea.MouseModeCellMotion`。
+- [`Init`](../internal/cli/tui/model.go#L228-L232)：拉起异步 git 探测、聚焦输入框、请求终端背景色。alt-screen 不在 `Init` 里开，而是通过 `View` 返回值声明。
+- [`Update`](../internal/cli/tui/model.go#L238-L547)：唯一的纯状态迁移入口，一个大 `type switch` 分派所有 `tea.Msg`。
+- [`View`](../internal/cli/tui/model.go#L1186-L1198)：渲染，并声明 `AltScreen: true` 与 `MouseMode: tea.MouseModeCellMotion`。
 
 ```go
 func (m Model) View() tea.View {
@@ -124,7 +135,7 @@ func (m Model) View() tea.View {
 
 ## 五、事件桥：两条 goroutine，一个 channel
 
-这是整个 TUI 最核心的一块（[`bridge.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go)）。问题陈述很直白：**agent 循环在 emit 事件，tea 循环一次只处理一个 `tea.Msg`**，中间需要一个泵。
+这是整个 TUI 最核心的一块（[`bridge.go`](../internal/cli/tui/bridge.go#L28-L139)）。问题陈述很直白：**agent 循环在 emit 事件，tea 循环一次只处理一个 `tea.Msg`**，中间需要一个泵。
 
 ```mermaid
 sequenceDiagram
@@ -142,56 +153,118 @@ sequenceDiagram
     M-->>U: Update → View 重绘
 ```
 
-三个原语（均集中在 bridge.go，可脱离真实 provider 单测）：
+桥由五个原语拼成，全部集中在 bridge.go，且都能脱离真实 provider 单测：
 
-- [`newStreamHandler`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go#L44-L76)：构造 `runtime.StreamHandler`，把每个回调/事件转成对应 `tea.Msg` 塞进 channel。`OnEvent` 先投递观察者事件（插件通知器、SessionEnd/PreCompact hook），再翻译成 TUI 消息。
-- [`pump`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go#L113-L117)：阻塞地跑完一次 run，最后发 `runEndMsg{err}`。
-- [`waitForEvent`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go#L123-L127)：一个 `tea.Cmd`，`return <-ch` 阻塞等一条消息。
+| 原语                                                                                                              | 位置      | 职责                                                                        |
+| :---------------------------------------------------------------------------------------------------------------- | :-------- | :-------------------------------------------------------------------------- |
+| [`startRun`](../internal/cli/tui/bridge.go#L135-L139)                                                             | L135-L139 | 建 channel、`go pump(...)`，把「channel + 第一条 `waitForEvent`」交回 Model |
+| [`pump`](../internal/cli/tui/bridge.go#L113-L117)                                                                 | L113-L117 | 在 bridge goroutine 上跑完一次 run，收尾发 `runEndMsg`                      |
+| [`newStreamHandler`](../internal/cli/tui/bridge.go#L44-L76)                                                       | L44-L76   | 把 `runtime.StreamHandler` 的三个回调翻译成 `tea.Msg`                       |
+| [`waitForEvent`](../internal/cli/tui/bridge.go#L123-L127)                                                         | L123-L127 | 一个 `tea.Cmd`，阻塞读走一条消息                                            |
+| [`newEventChan`](../internal/cli/tui/bridge.go#L35-L37) / [`eventChanCap`](../internal/cli/tui/bridge.go#L28-L31) | L28-L37   | 容量 64 的带缓冲 channel                                                    |
 
-`Model` 侧靠 [`pumpNext`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1173-L1178) 维持节奏——**每处理完一条桥消息就再发一次 `waitForEvent(ch)`**，于是事件被一条条拉出来、顺序天然保序，tea 循环也从不空转：
+**建立：`startRun` 一次交出手柄。** 它只做三件事，但返回值刻意是 `(chan, tea.Cmd)` 而不是把 channel 藏进闭包——Model 因此持有 channel 句柄，能自己决定何时停止拉取：
+
+```go
+func startRun(ctx context.Context, agentCtx *agentcore.AgentContext, cfg runtime.RunConfig, onEvent func(agentcore.AgentEvent)) (chan tea.Msg, tea.Cmd) {
+	ch := newEventChan()
+	go pump(ctx, ch, agentCtx, cfg, onEvent)
+	return ch, waitForEvent(ch)
+}
+```
+
+**翻译：`newStreamHandler` 的三条路径。** `runtime.StreamHandler` 只有三个回调，各对应一类消息：
+
+| 回调                      | 触发时机                | 产出                         |
+| :------------------------ | :---------------------- | :--------------------------- |
+| `OnText(delta)`           | 流式文本增量            | `textDeltaMsg`               |
+| `OnTurnEnd(msg, results)` | 一次 assistant 回合收尾 | `turnEndMsg`                 |
+| `OnEvent(ev)`             | 结构化 `AgentEvent`     | 观察者回调 + 下表的 7 种消息 |
+
+`OnEvent` 内部是一个 `type switch`，负责把结构化事件分类翻译：
+
+| `AgentEvent`                               | `tea.Msg`                                 |
+| :----------------------------------------- | :---------------------------------------- |
+| `ToolExecutionStartEvent`                  | `toolStartMsg`（`Args` 先过 `argsToMap`） |
+| `ToolExecutionUpdateEvent`                 | `toolUpdateMsg`                           |
+| `ToolExecutionEndEvent`                    | `toolEndMsg`（带 `IsError` 与 `Details`） |
+| `SubAgentProgressEvent`                    | `subagentProgressMsg`                     |
+| `TelemetryEvent`                           | `telemetryMsg`                            |
+| `CompactionStartEvent` / `CompactionEvent` | `compactionStartMsg` / `compactionMsg`    |
+
+两个顺序细节值得留意：一是 `OnEvent` **先**把事件交给 `extra(ev)`（观察者链上的插件通知器与 SessionEnd/PreCompact hook），**再**翻译成 TUI 消息，hook 看到的顺序因此与屏幕渲染顺序一致；二是所有 `ch <-` 都是阻塞发送，回调这一层本身没有任何缓冲或异步——缓冲只存在于 channel 里。
+
+**泵：`pump` 是「一次 run 一条 goroutine」。**
+
+```go
+func pump(ctx context.Context, ch chan tea.Msg, agentCtx *agentcore.AgentContext, cfg runtime.RunConfig, onEvent func(agentcore.AgentEvent)) {
+	stream := runtime.StartRun(ctx, agentCtx, cfg)
+	_, err := runtime.DrainStream(ctx, stream, newStreamHandler(ch, onEvent))
+	ch <- runEndMsg{err: err}
+}
+```
+
+三行就交代完一次 run 的一生：`StartRun` 建流、`DrainStream` 消费到流关闭、`runEndMsg` 收尾。它是唯一直接写 `agentCtx.Messages` 的地方，也是唯一往 `ch` 里发消息的地方（除最后这句收尾外，其余消息都由 `newStreamHandler` 的回调代发）。注意 **`runEndMsg` 必须等 `DrainStream` 返回之后才发**，这条时序是后面 `persist()` 敢在 tea goroutine 上直接读 `Messages` 的全部依据。
+
+**拉取：`waitForEvent` 与 `Update` 里的「续期协议」。**
+
+```go
+func waitForEvent(ch chan tea.Msg) tea.Cmd {
+	return func() tea.Msg { return <-ch }
+}
+```
+
+它是 `tea.Cmd`，Bubble Tea 会把它放到**自己的 goroutine** 上执行，所以 `<-ch` 阻塞的是那条命令 goroutine，**不会卡住 `Update`**；消息一到，tea 运行时把返回值送回主循环，触发一次 `Update`。
+
+真正的节奏感来自 `Update` 里的**续期（re-arm）协议**：每一个消费桥消息的 case 都以 `return m, m.pumpNext()` 结尾——`textDeltaMsg`、`turnEndMsg`、`toolStartMsg`、`toolUpdateMsg`、`subagentProgressMsg`、`toolEndMsg`、`telemetryMsg`、`compactionStartMsg`、`compactionMsg`、`runEndMsg` 无一例外。于是「处理一条 → 立刻再挂一条」，channel 被一条条拉空：
 
 ```go
 func (m Model) pumpNext() tea.Cmd {
 	if m.running && m.runCh != nil {
-		return waitForEvent(m.runCh)
+		return waitForEvent(m.runCh)   // 还在跑：续一条
 	}
-	return nil   // runEndMsg 后 runCh 置 nil，泵自然停止
+	return nil                          // runEndMsg 已清空 runCh：自然停摆
 }
 ```
 
-设计要点：
+`runEndMsg` 的处理里会先 `m.running = false`、`m.runCh = nil`，所以它结尾那句 `m.pumpNext()` 必然返回 `nil`——泵的终止不需要任何额外信号，它是「条件不成立」的自然结果。
 
-- **channel 是唯一同步点**：生产者不碰 Model，消费者不碰 run，所有状态迁移都发生在 tea goroutine 上。
-- **背压是刻意的**：`eventChanCap = 64` 的缓冲让一段工具事件突发能排进队列而不必每次 send 都阻塞；超过 64 就阻塞生产者，**绝不丢弃**——tea 循环总会追上。
-- **`argsToMap` 的容错**：工具调用参数的 `Args` 在事件层是 `any`，可能是 `json.RawMessage`、`[]byte`、已解码的 `map`、甚至 `string`，统一收敛成 `map[string]any` 供工具卡片展示，非 JSON 对象一律返回 `nil`。
+这四步叠在一起，同时拿到了四个性质：
+
+- **保序**：生产者只有一个（pump goroutine 串行执行 `DrainStream` 的回调），channel 是 FIFO，消费者也只有一个（tea 主循环一次只处理一条 `tea.Msg`）；三者叠加使「事件发生顺序 = 屏幕渲染顺序」。
+- **不丢**：`ch <-` 是阻塞发送，缓冲写满就阻塞生产者，背压一路传导回 provider 的流——`eventChanCap = 64` 只是让一段工具事件突发能先排进队列、不必每次 send 都等消费者，**绝不丢弃、绝不覆盖**。
+- **不空转**：`waitForEvent` 只在有在途 run 时被挂上；run 结束后 `pumpNext` 返回 `nil`，tea 循环保持空闲，没有任何轮询。
+- **无竞态**：所有 `m.*` 状态迁移都发生在 tea goroutine，pump 只碰 `agentCtx` 和 channel；所以 `runEndMsg` 里 `persist()` 可以放心读 `Messages`——`DrainStream` 已返回，再无人写。
+
+还有一个容错细节：**`argsToMap`**（[bridge.go](../internal/cli/tui/bridge.go#L83-L95)）把工具调用参数的 `Args` 从事件层的 `any` 收敛成 `map[string]any`——它可能是 `json.RawMessage`、`[]byte`、已解码的 `map`，甚至 `string`，非 JSON 对象一律返回 `nil`，保证工具卡片不会因为参数形态不同而崩。
 
 ---
 
 ## 六、Update 消息分派表
 
-`tea.Msg` 类型全部定义在 [`msgs.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/msgs.go)，一律用**值类型**（不是指针），这样穿过 `chan any` 时不会别名到生产者的状态：
+`tea.Msg` 类型全部定义在 [`msgs.go`](../internal/cli/tui/msgs.go#L1-L84)，一律用**值类型**（不是指针），这样穿过 `chan any` 时不会别名到生产者的状态：
 
-| tea.Msg                                    | 由哪个事件产生             | `Update` 里的动作                                               |
-| :----------------------------------------- | :------------------------- | :-------------------------------------------------------------- |
-| `tea.WindowSizeMsg`                        | 终端尺寸                   | 记录宽高并 `relayout()`                                         |
-| `tea.BackgroundColorMsg`                   | 终端背景色                 | `SetMarkdownDark` + `transcript.reflow()` 重刷配色              |
-| `tea.KeyPressMsg`                          | 键盘                       | `handleKey()` → 提交 / 中断 / 交给 textarea                     |
-| `tea.MouseWheelMsg`                        | 滚轮                       | 交给 transcript viewport 滚动，清空选区                         |
-| `tea.MouseClickMsg` / `Motion` / `Release` | 鼠标                       | 滚动条拖拽 或 文本框选                                          |
-| `tea.PasteMsg` / `ClipboardMsg`            | 括号粘贴 / OSC52           | `handlePaste`：多行折叠为占位符                                 |
-| `clipboardImageMsg`                        | 图片读取回应               | `handleImagePaste`，无图则回退成文本读取                        |
-| `textDeltaMsg`                             | `OnText`                   | `transcript.appendDelta` + `spinner.addTokens`                  |
-| `turnEndMsg`                               | `OnTurnEnd`                | `finalizeTurn`，并兜底报错 / 空响应                             |
-| `toolStartMsg`                             | `ToolExecutionStartEvent`  | 建 `toolCard` 入 map 并插入 transcript；`task` 另开子代理面板行 |
-| `toolUpdateMsg`                            | `ToolExecutionUpdateEvent` | 累积子代理输出                                                  |
-| `toolEndMsg`                               | `ToolExecutionEndEvent`    | 翻转卡片状态、解析结果（含 `ui.DiffFromDetails` 的 diff）       |
-| `subagentProgressMsg`                      | `SubAgentProgressEvent`    | 刷新面板行的 activity / tokens                                  |
-| `telemetryMsg`                             | `TelemetryEvent`           | 更新状态栏上下文占用 + `telemetry.Fold`                         |
-| `compactionStartMsg` / `compactionMsg`     | Compaction 事件            | spinner 钉住 / 解除 + 系统提示                                  |
-| `runEndMsg`                                | `pump` 收尾                | 停 `running`、`persist()`、重新聚焦输入                         |
-| `rebuildDoneMsg`                           | `/rebuild` 异步收尾        | 解 pin spinner，报告结果                                        |
-| `spinnerTickMsg`                           | 自调度 tick                | 推进动画帧，仅运行中续期                                        |
-| `remoteInputMsg`                           | 远程浏览器                 | 复用 submit / slash 路径                                        |
+| tea.Msg                                    | 由哪个事件产生             | `Update` 里的动作                                                                     |
+| :----------------------------------------- | :------------------------- | :------------------------------------------------------------------------------------ |
+| `tea.WindowSizeMsg`                        | 终端尺寸                   | 记录宽高并 `relayout()`                                                               |
+| `tea.BackgroundColorMsg`                   | 终端背景色                 | `SetMarkdownDark` + `transcript.reflow()` 重刷配色                                    |
+| `tea.KeyPressMsg`                          | 键盘                       | `handleKey()` → 提交 / 中断 / 交给 textarea                                           |
+| `tea.MouseWheelMsg`                        | 滚轮                       | 交给 transcript viewport 滚动，清空选区                                               |
+| `tea.MouseClickMsg` / `Motion` / `Release` | 鼠标                       | 滚动条拖拽 或 文本框选                                                                |
+| `tea.PasteMsg` / `ClipboardMsg`            | 括号粘贴 / OSC52           | `handlePaste`：多行折叠为占位符                                                       |
+| `clipboardImageMsg`                        | 图片读取回应               | `handleImagePaste`，无图则回退成文本读取                                              |
+| `textDeltaMsg`                             | `OnText`                   | `transcript.appendDelta` + `spinner.addTokens`                                        |
+| `turnEndMsg`                               | `OnTurnEnd`                | `finalizeTurn`，并兜底报错 / 空响应                                                   |
+| `toolStartMsg`                             | `ToolExecutionStartEvent`  | 建 `toolCard` 入 map 并插入 transcript；`task` 另开子代理面板行                       |
+| `toolUpdateMsg`                            | `ToolExecutionUpdateEvent` | 累积子代理输出                                                                        |
+| `toolEndMsg`                               | `ToolExecutionEndEvent`    | 翻转卡片状态、解析结果（含 `ui.DiffFromDetails` 的 diff）                             |
+| `subagentProgressMsg`                      | `SubAgentProgressEvent`    | 刷新面板行的 activity / tokens                                                        |
+| `telemetryMsg`                             | `TelemetryEvent`           | 更新状态栏上下文占用 + `telemetry.Fold`                                               |
+| `compactionStartMsg` / `compactionMsg`     | Compaction 事件            | spinner 钉住 / 解除 + 系统提示                                                        |
+| `runEndMsg`                                | `pump` 收尾                | 停 `running`、`persist()`、重新聚焦输入                                               |
+| `rebuildDoneMsg`                           | `/rebuild` 异步收尾        | 解 pin spinner，报告结果                                                              |
+| `spinnerTickMsg`                           | 自调度 tick                | 推进动画帧，仅运行中续期                                                              |
+| `remoteInputMsg`                           | 远程浏览器                 | 斜杠走 `runSlash`；普通文本补做 `addUser` 后**直接**进 `startPrompt`（绕过 `submit`） |
 
 两处值得一提的**兜底**：
 
@@ -212,8 +285,9 @@ flowchart TD
     C -->|否| E["expandPastes / expandImages<br/>占位符还原为正文与 @image: 引用"]
     D --> F["startPrompt(prompt)"]
     E --> F
-    F --> G{"startRunFn 已接线?"}
-    G -->|否| H["记录 run not wired up<br/>系统提示，保持空闲"]
+    R["remoteInputMsg<br/>(远程浏览器输入，非 / 开头)"] --> F
+    F --> G{"startRunFn 是否已注入?"}
+    G -->|否| H["未注入：记录 run not wired up<br/>系统提示，保持空闲"]
     G -->|是| I["input.Blur()<br/>running = true, spinner.begin()"]
     I --> J["session.startRun(prompt)"]
     J --> K["DispatchUserPromptSubmit<br/>block → ch 里塞一条 runEndMsg，不发车"]
@@ -226,13 +300,41 @@ flowchart TD
 
 几个关键设计：
 
-- **提交前的占位符还原**：多行粘贴被折叠成 `[Pasted text #N +M lines]`，图片粘贴折叠成 `[Image #N]`；`submit` 在发车前用 [`expandPastes`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1108-L1123) / [`expandImages`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1153-L1168) 换回真实内容（图片变成 `@image:<path>` 交给 `ui.BuildUserContent` 组装多模态块）。这样大段粘贴不会把编辑器撑爆。
-- **斜杠命令先经注册表**：`runSlash` 与 REPL 的 dispatch 对齐。`/exit`、`/memory`、`/status`、`/session`、`/rebuild`、`/remote-control` 会在注册表解析**之前**被拦截，因为它们需要读取 host 才能拿到的实时状态（`cli.Host` 契约由 [`host.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/host.go) 让 `runSession` 满足）。
+- **提交前的占位符还原**：多行粘贴被折叠成 `[Pasted text #N +M lines]`，图片粘贴折叠成 `[Image #N]`；`submit` 在发车前用 [`expandPastes`](../internal/cli/tui/model.go#L1108-L1123) / [`expandImages`](../internal/cli/tui/model.go#L1153-L1168) 换回真实内容（图片变成 `@image:<path>` 交给 `ui.BuildUserContent` 组装多模态块）。这样大段粘贴不会把编辑器撑爆。
+- **斜杠命令先经注册表**：`runSlash` 与 REPL 的 dispatch 对齐。`/exit`、`/memory`、`/status`、`/session`、`/rebuild`、`/remote-control` 会在注册表解析**之前**被拦截，因为它们需要读取 host 才能拿到的实时状态（`cli.Host` 契约由 [`host.go`](../internal/cli/tui/host.go#L29-L58) 让 `runSession` 满足）。
 - **Hook 在 prompt 落 context 之前**：`DispatchUserPromptSubmit` 若 block，会合成一个只含错误的 `runEndMsg`，**不留下悬空的 user 消息**。
+
+### 三个入口，同一个 startPrompt
+
+上面这张图只画了本地键盘这一条。实际上 [`startPrompt`](../internal/cli/tui/model.go#L996-L1008) 有三个调用点，它们都是「用户发起一轮对话」的入口：
+
+| 入口     | 调用点                                                     | 触发条件                                                                                                          |
+| :------- | :--------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| 本地提交 | [`submit`](../internal/cli/tui/model.go#L769) 末尾         | `handleKey` 的 `case "enter"` → `submit()`，且输入不以 `/` 开头                                                   |
+| 斜杠展开 | [`runSlash`](../internal/cli/tui/model.go#L929) 末尾       | [L926](../internal/cli/tui/model.go#L926) 放行 `Kind != SlashAction && Prompt != ""`，即 prompt / skill 类命令    |
+| 远程输入 | [`case remoteInputMsg`](../internal/cli/tui/model.go#L541) | 远程浏览器发来的文本不以 `/` 开头（[L526](../internal/cli/tui/model.go#L526) 先挡掉空输入和「正在跑 run」的情况） |
+
+三条路径汇合后行为是统一的：`startRunFn == nil`（测试、或未装配 session 的模型）只记一条 `(run not wired up)` 系统提示并**保持空闲**；否则 `input.Blur()` → `startRunFn(prompt)` 换取 `(ch, cmd)` → `running = true` + `spinner.begin` + `relayout`，最后 `tea.Batch(cmd, m.tickSpinner())`——`cmd` 是事件桥的第一条 `waitForEvent`，`tickSpinner` 是 spinner 的自调度动画 tick，两者并跑。这个注入在 [`withSession`](../internal/cli/tui/model.go#L210-L223) 里完成（`m.startRunFn = s.startRun`），所以三个入口最终都落到同一次 run。
+
+两点差异值得记：
+
+- **只有本地提交走 `submit`**。远程输入这条路绕过了 `submit`，所以它自己补做了 `addUser` + `remoteEcho`，也就**不经过占位符还原**（`expandPastes` / `expandImages`）。
+- **action 类斜杠命令根本不进 `startPrompt`**。`/exit`、`/memory`、`/status` 这类在 `runSlash` 的 L926 处就 `return m, nil` 了，只有 prompt / skill 类命令才会走到 L929——所以图里「以 `/` 开头 → `startPrompt`」这个分支是**有条件**的。
+
+### 远程输入：会话的第二个端点
+
+`remoteInputMsg` 来自 `/remote-control`：TUI 在自己进程内起一个 HTTP + WebSocket 服务（[internal/remotecontrol](../internal/remotecontrol/server.go)、[bridge.go](../internal/remotecontrol/bridge.go)），把当前会话镜像到同一局域网内的浏览器。它**不是另起一个 agent 或新会话**，而是同一个 `runSession`、同一份 `agentCtx` 的第二个输入/输出端点。
+
+- **出**：[`remoteEcho`](../internal/cli/tui/remotecontrol.go#L184-L188) 在 transcript 每次新增可见内容时送一份给 server；**即使当时没有浏览器连着也会记进 replay ring**，中途才配对上的浏览器因此能收到最近的回放。
+- **入**：[`waitRemoteInput`](../internal/cli/tui/remotecontrol.go#L194-L206) 是一个 `tea.Cmd`，阻塞在 `bridge.RemoteInput()` channel 上，每收到一次浏览器提交就产出 [`remoteInputMsg`](../internal/cli/tui/msgs.go#L80-L84)。
+
+它和事件桥的 `pumpNext` 是**同一个「续期」模式**：`case remoteInputMsg` 无论走哪条分支，结束时必然再挂一次 `waitRemoteInput()`，输入才能持续进来（`tea.Batch(cmd, m.waitRemoteInput())`）；远程控制关闭时它返回 `nil`，监听自然停摆。另外，它只在这个 case 里被处理——**正在跑 run 时提交会被丢弃并留一条系统提示，但不打断当前 run**，这与本地单 run 门控是同一个约束，却不像 `ctrl+c` 那样触发中断。
+
+生命周期由 [`runRemoteControl`](../internal/cli/tui/remotecontrol.go#L126-L179) 管理：`/remote-control` 启动、打印配对 URL 与二维码，`stop` / `status` 子命令收尾；服务句柄（`{server, bridge, url}`）挂在 `s.remote` 上，进程退出时由 [`shutdownRemote`](../internal/cli/tui/model.go#L1057-L1062) 收掉，避免监听器泄漏。还有一条容易忽略的联动：浏览器已配对时，需要确认的工具调用会被路由到浏览器（[`remoteConfirmSeam`](../internal/cli/tui/remotecontrol.go#L88-L111)，未信任目录直接 block）；没有 client 时不装这个 seam，工具按 TUI 已授予的信任直接跑。
 
 ### 落盘：分支追加而非线性重写
 
-[`persist`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/session.go#L438-L473) 有两种模式：
+[`persist`](../internal/cli/tui/session.go#L438-L473) 有两种模式：
 
 - **常规**：把 `Messages[persisted:]` 作为新分支用 `AppendBranch` 从 `curLeaf` 长出去，推进 leaf 与游标——保留完整会话树，让 `/fork`、`/clone` 有意义。
 - **compaction 之后**：压缩把 `Messages` 重写成「摘要 + 近期尾部」，前缀变了、切片还可能比 `persisted` 短，增量的 `Messages[persisted:]` 会越界。此时改为 `store.Save` 线性重写，并重置分支游标。
@@ -249,13 +351,13 @@ if s.compacted || s.persisted > len(s.agentCtx.Messages) {
 
 ## 八、键盘映射与两段式中断
 
-[`handleKey`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L554-L739) 是按键的唯一入口，整体是**优先级从高到低的三层**：
+[`handleKey`](../internal/cli/tui/model.go#L554-L739) 是按键的唯一入口，整体是**优先级从高到低的三层**：
 
 1. **补全菜单**（空闲且 `menu.active`）：`up`/`down` 移动、`tab` 补全、`esc` 关闭、`enter` 执行选中项。
 2. **子代理面板**（运行中、有 live 子代理、输入框为空）：`up`/`down` 选择行、`enter` 展开、`esc` 清选并重新聚焦输入框。
 3. **全局键**：`ctrl+c` / `super+c` / `esc` / `ctrl+o` / `ctrl+d` / `enter` / `pgup` / `pgdown` / `ctrl+v` / `super+v` / `ctrl+y`。
 
-其中最关键的是**两段式中断**（[`interruptOrQuit`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1044-L1055)）：
+其中最关键的是**两段式中断**（[`interruptOrQuit`](../internal/cli/tui/model.go#L1044-L1055)）：
 
 ```go
 func (m Model) interruptOrQuit() (tea.Model, tea.Cmd) {
@@ -286,7 +388,7 @@ func (m Model) interruptOrQuit() (tea.Model, tea.Cmd) {
 
 ## 九、布局是减法：relayout 与渲染分层
 
-[`relayout`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1327-L1344) 的思路是**先扣掉所有固定开销，剩下的才给 transcript**：
+[`relayout`](../internal/cli/tui/model.go#L1327-L1344) 的思路是**先扣掉所有固定开销，剩下的才给 transcript**：
 
 ```go
 rows := m.height - 1 - m.input.Height() - m.menu.rows()
@@ -301,7 +403,7 @@ m.transcript.setSize(m.width, rows)
 m.input.SetWidth(m.width)
 ```
 
-渲染的垂直分层（[`renderContent`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go#L1204-L1262)，自上而下）：
+渲染的垂直分层（[`renderContent`](../internal/cli/tui/model.go#L1204-L1262)，自上而下）：
 
 ```mermaid
 flowchart TD
@@ -321,14 +423,17 @@ flowchart TD
 
 ## 十、相关源码索引
 
-- 入口分派与门控：[`cmd/pigo/main.go:dispatch`](file:///Users/yuqing/Documents/workspace/pigo/cmd/pigo/main.go#L425-L481)、[`shouldUseTUI`](file:///Users/yuqing/Documents/workspace/pigo/cmd/pigo/main.go#L653-L655)
-- TUI 入口：[`internal/cli/tui/run.go:Run`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/run.go#L13-L24)
-- 包定位与设计依据：[`internal/cli/tui/doc.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/doc.go)
-- 根模型（Init/Update/View、handleKey、relayout）：[`internal/cli/tui/model.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/model.go)
-- 事件桥：[`internal/cli/tui/bridge.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/bridge.go)
-- `tea.Msg` 类型定义：[`internal/cli/tui/msgs.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/msgs.go)
-- 会话装配 / run 接缝 / 落盘：[`internal/cli/tui/session.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/session.go)
-- `cli.Host` 契约实现：[`internal/cli/tui/host.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/host.go)
-- 滚动消息区：[`internal/cli/tui/transcript.go`](file:///Users/yuqing/Documents/workspace/pigo/internal/cli/tui/transcript.go)
-- 内核（两条路径共用）：[`runtime.StartRun`](file:///Users/yuqing/Documents/workspace/pigo/internal/runtime/loop.go#L135)、[`runtime.DrainStream`](file:///Users/yuqing/Documents/workspace/pigo/internal/runtime/render.go#L40)
+- 入口分派与门控：[`cmd/pigo/main.go:dispatch`](../cmd/pigo/main.go#L377-L533)、[`shouldUseTUI`](../cmd/pigo/main.go#L653-L655)
+- TUI 入口：[`internal/cli/tui/run.go:Run`](../internal/cli/tui/run.go#L13-L24)
+- 包定位与设计依据：[`doc.go`](../internal/cli/tui/doc.go#L1-L14)
+- 根模型：[`NewModel`](../internal/cli/tui/model.go#L173-L203)、[`withSession`](../internal/cli/tui/model.go#L210-L223)、[`Init`](../internal/cli/tui/model.go#L228-L232)、[`Update`](../internal/cli/tui/model.go#L238-L547)、[`handleKey`](../internal/cli/tui/model.go#L554-L739)、[`submit`](../internal/cli/tui/model.go#L746-L770)、[`runSlash`](../internal/cli/tui/model.go#L802-L930)、[`startPrompt`](../internal/cli/tui/model.go#L996-L1008)、[`interruptOrQuit`](../internal/cli/tui/model.go#L1044-L1055)、[`pumpNext`](../internal/cli/tui/model.go#L1173-L1178)、[`View`](../internal/cli/tui/model.go#L1186-L1198)、[`renderContent`](../internal/cli/tui/model.go#L1204-L1262)、[`relayout`](../internal/cli/tui/model.go#L1327-L1344)
+- 事件桥：[`eventChanCap`](../internal/cli/tui/bridge.go#L28-L31)、[`newEventChan`](../internal/cli/tui/bridge.go#L35-L37)、[`newStreamHandler`](../internal/cli/tui/bridge.go#L44-L76)、[`argsToMap`](../internal/cli/tui/bridge.go#L83-L95)、[`unmarshalArgsMap`](../internal/cli/tui/bridge.go#L99-L108)、[`pump`](../internal/cli/tui/bridge.go#L113-L117)、[`waitForEvent`](../internal/cli/tui/bridge.go#L123-L127)、[`startRun`](../internal/cli/tui/bridge.go#L135-L139)
+- `tea.Msg` 类型定义：[`msgs.go`](../internal/cli/tui/msgs.go#L1-L84)
+- 会话装配：[`newRunSessionWithStore`](../internal/cli/tui/session.go#L138-L264)、[`buildConfig`](../internal/cli/tui/session.go#L297-L337)
+- run 注入点：[`startRun`](../internal/cli/tui/session.go#L393-L422)、[`interrupt`](../internal/cli/tui/session.go#L427-L431)
+- 落盘：[`persist`](../internal/cli/tui/session.go#L438-L473)、[`seedTranscript`](../internal/cli/tui/session.go#L481-L497)
+- `cli.Host` 契约实现：[`host.go`](../internal/cli/tui/host.go#L29-L58)
+- 滚动消息区：[`transcript`](../internal/cli/tui/transcript.go#L52-L80)、[`setSize`](../internal/cli/tui/transcript.go#L97-L107)、[`addUser`](../internal/cli/tui/transcript.go#L116-L121)、[`appendDelta`](../internal/cli/tui/transcript.go#L150-L157)、[`finalizeTurn`](../internal/cli/tui/transcript.go#L162-L173)、[`update`](../internal/cli/tui/transcript.go#L178-L183)、[`view`](../internal/cli/tui/transcript.go#L244-L271)、[`scrollbar`](../internal/cli/tui/transcript.go#L284-L329)、[`reflow`](../internal/cli/tui/transcript.go#L344-L361)、[`renderBlock`](../internal/cli/tui/transcript.go#L387-L404)
+- 内核（两条路径共用）：[`runtime.StartRun`](../internal/runtime/loop.go#L135)、[`runtime.DrainStream`](../internal/runtime/render.go#L40)
+- 远程控制：[`runRemoteControl`](../internal/cli/tui/remotecontrol.go#L126-L179)、[`remoteEcho`](../internal/cli/tui/remotecontrol.go#L184-L188)、[`waitRemoteInput`](../internal/cli/tui/remotecontrol.go#L194-L206)、[`remoteConfirmSeam`](../internal/cli/tui/remotecontrol.go#L88-L111)、[`shutdownRemote`](../internal/cli/tui/model.go#L1057-L1062)、[`internal/remotecontrol`](../internal/remotecontrol/server.go)
 - 对照阅读：[行式 REPL 与全屏 TUI 架构对比](./行式REPL与全屏TUI架构对比.md)
