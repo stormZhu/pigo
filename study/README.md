@@ -172,4 +172,19 @@
     - 落盘双模式：常规走 `AppendBranch` 分支追加保留会话树；compaction 后退化线性重写并重置分支游标
     - 布局与渲染：`relayout` 先扣固定开销再给 transcript，`follow` 语义、`applySelection` 后置覆盖与自适应滚动条
 
+25. [Dream 记忆整合机制与后台触发设计](./Dream记忆整合机制与后台触发设计.md)
+    - 术语溯源：`consolidation`（记忆巩固）借自神经科学，本项目译为「记忆整合」，指把记忆库压实成紧凑、无冗余、反映当前状态的集合
+    - 一次 pass 全景：抢锁 → `BuildPlan`（确定性）→ `Consolidator`（LLM 两次调用）→ 落盘 → 重建索引 → 写 `state.json` → stdout 打一行 `Report`
+    - 两半分工：Go 做精确去重 / 死路径清理 / 近似重复配对（Jaccard ≥ 0.7），LLM 只做 MERGE / PRUNE / DISTILL 语义判断
+    - 保守原则与安全边界：宁可留冗余也不丢记忆（解析失败即全保留），LLM 产出的路径必须落在 `withinScope` 之内且做 symlink 解析
+    - 触发与调度：默认开启、间隔 7 天、首次不自动触发；`O_EXCL` 单实例锁，抢不到即静默 `skipped`，陈旧锁 30 分钟可接管
+    - REPL 有 / TUI 无：`Dream` 是 REPL 独有的 `Options` 字段（非遗忘），且 alt-screen 下异步写 stdout 会花屏
 
+26. [斜杠命令注册表 SlashRegistry 与双前端共用设计](./斜杠命令注册表SlashRegistry与双前端共用设计.md)
+    - 一张 `/name → 行为` 的映射表：`commands` map + `shadowed` 诊断列表
+    - 命令三种「性格」由回调决定：`Expand`（喂提示）/ `Action`（改状态、不启动运行）/ `Run`（插件混合），优先序 `Action > Run > Expand`
+    - 动作命令机制：`Action` 闭包捕获 `*LiveConfig` **指针**并原地改写，故副作用对运行循环立即可见；解析即执行，前端只负责显示；`/remote-control` 因所需状态在注册表构建时尚不存在而改走前置拦截
+    - 四类来源 + 六档 Tier：`CLI < Settings < Package < Global < Project < Builtin`，高 Tier 赢、输家进 `Shadowed`，同 Tier 后写覆盖
+    - 内置注册约定：`RegisterBuiltin` 仅 init 期调用、重名 panic，故全局 map 无需加锁
+    - 装配与解析：`prompts.BuildSlashRegistry` 统一组装；`ResolveOutcome` 四态返回（非命令 / 提示 / 动作 / 混合）
+    - 双前端共用：REPL 与 TUI 调同一个 `BuildSlashRegistry`，TUI 只额外加 `slashMenu` 补全；`/remote-control` 这类需持有状态的命令在解析前被各自前端特判

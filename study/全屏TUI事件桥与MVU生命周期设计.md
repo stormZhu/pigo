@@ -23,13 +23,32 @@
 
 TUI 本质上是一台 **Bubble Tea v2 的 MVU 状态机**（Model / Update / View），外加一条把 agent 运行时的 `AgentEvent` 翻译成 `tea.Msg` 的**事件桥**。
 
+### 先立个约定：`Model` 有两个含义
+
+全文大量出现 `Model`，但它在同一个包里被重载成了两个毫不相干的东西——**MVU 状态机**和**LLM 模型名**。先分清再往下读：
+
+| 写法                                                             | 含义                                  | 位置                                                                                                    |
+| :--------------------------------------------------------------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------ |
+| `type Model struct`                                              | **MVU 状态机**：整个 TUI 的状态快照   | [`model.go`](../internal/cli/tui/model.go#L32-L164)                                                     |
+| `NewModel(opts) Model`、`func (m Model) Update(...)`             | 同上，作类型 / 接收者使用             | [`model.go`](../internal/cli/tui/model.go#L173-L203)                                                    |
+| `Options.Model`、`live.Model`、`header.Model`、`statusBar.model` | **LLM 模型名**（如 `gpt-4` 的字符串） | [`options.go`](../internal/cli/tui/options.go#L17)、[`session.go`](../internal/cli/tui/session.go#L190) |
+
+区分办法很机械：
+
+- `Model` 作**类型**用（构造返回、方法接收者）→ MVU 状态机。
+- `Model` 作**字符串字段**用（`opts.Model`、`live.Model`）→ LLM 模型名，即「用哪个大模型」。
+
+所以 `NewModel(opts)` 的读法是「用 `opts`（其中含 LLM 配置 `opts.Model`）构造 MVU 状态机」；返回的那个 `Model` 里装着 `m.opts`、`m.transcript`、`m.input` 等 **UI 状态，与 LLM 无关**。也正因如此，方向是 MVU Model 持有 `m.opts`（含 LLM 配置），而不是反过来。
+
+> 本文以下若不加限定，**`Model` 一律指 MVU 状态机**；指 LLM 时一律写成 `opts.Model` / `live.Model` 这类带前缀的形式。
+
 它有三条硬约束贯穿全文，记牢这三条，后面所有代码都顺理成章：
 
 1. **单写者**：agent 循环跑在 `pump` goroutine 上，独占 `agentCtx.Messages`；tea 循环跑在另一条 goroutine 上，独占 `Model`。两者只通过一个 channel 对话，绝不互相触碰对方状态。
 2. **事件不丢**：channel 是带缓冲的（容量 64），满了就阻塞生产者，形成背压——宁可让模型等，也不丢任何一条事件。
 3. **表现层可替换**：TUI 与 REPL 共用同一套 `runtime.StartRun` + `runtime.DrainStream` 内核，差异只在事件消费端——TUI 把它转成 `tea.Msg`，REPL 直接 `fmt.Fprint`。
 
-`doc.go` 也明确写了这个定位：TUI 是「行式 REPL 的 alt-screen 对应物」，由 `cmd/pigo` 在没有 prompt、stdout 是 TTY 且未设 `--no-tui` 时分派进入。
+[`doc.go`](../internal/cli/tui/doc.go) 也明确写了这个定位：TUI 是「行式 REPL 的 alt-screen 对应物」，由 `cmd/pigo` 在没有 prompt、stdout 是 TTY 且未设 `--no-tui` 时分派进入。
 
 ---
 
@@ -59,8 +78,46 @@ func shouldUseTUI(opts cliOptions, isTTY bool) bool {
 
 两个关键点：
 
-- **两条路径吃同一份 `Options`**：[`tui.Options`](../internal/cli/tui/options.go#L16-L59) 字段与 `repl.Options` 逐一对齐，dispatch 才能把同一份装配结果映射到任一路径，不需要适配层。
+- **两条路径吃同一份 `Options`**：[`tui.Options`](../internal/cli/tui/options.go#L16-L59) 与 [`repl.Options`](../internal/cli/repl/interactive.go#L39-L84) 有 16 个字段逐一对齐，dispatch 才能把同一份装配结果映射到任一路径，不需要适配层（两者的差异见下）。
 - **非 TTY 强制降级**：在 CI 或 `| head` 这类管道里 `isTTY` 为假，强制走 REPL，避免脚本卡在 alt-screen 里。
+
+### 两个 `Options` 的差异
+
+它们是**两个各自独立声明的结构体**，不是别名也不是复用：共同子集逐字段一致，各自另有一个专有字段。
+
+| 结构体                                                        | 独有字段  | 用途                                                         |
+| :------------------------------------------------------------ | :-------- | :----------------------------------------------------------- |
+| [`tui.Options`](../internal/cli/tui/options.go#L16-L59)       | `Version` | 启动 banner 显示版本与升级提示                               |
+| [`repl.Options`](../internal/cli/repl/interactive.go#L39-L84) | `Dream`   | `[dream]` 配置（US-008），决定是否触发启动后台 consolidation |
+
+共同的 16 个字段（名称、类型、顺序全一致）：
+
+```
+Model  ProviderName  Provider  BaseURL  APIKey  Protocol  ThinkingLevel  Tools
+SysPrompt  ResumeID  Approve  Skills  Plugins  ConfigPrompts  CliPrompts  NoPromptTemplates
+```
+
+它们在 Go 里是两个**不同的命名类型**，即便字段全同也不能直接互相赋值（可赋值性要求两侧类型相同，或至少一侧是未命名类型）。所以 [dispatch](../cmd/pigo/main.go#L458-L499) 里是**两处 struct literal 逐字段复写**：
+
+```go
+tui.Run(tui.Options{
+    // ... 16 个共同字段
+    NoPromptTemplates: opts.noPromptTemplates,
+})
+repl.Run(repl.Options{
+    // ... 同样 16 个共同字段
+    NoPromptTemplates: opts.noPromptTemplates,
+    Dream:             opts.dreamCfg,        // REPL 独有
+})
+```
+
+既没有类型转换，也没有中间 DTO——这才是「不需要适配层」的真实含义：映射零成本，一眼能看出两条路径吃的是同一份环境。
+
+代价是对齐靠人工：谁加了字段，另一头得手动跟，编译器不会替你把关。也正因如此，TUI 路径天然没有 `Dream`（不做启动 [consolidation](./Dream记忆整合机制与后台触发设计.md)——也就是记忆整合），而不是「忘了传」：
+
+- **REPL 的机制**：REPL 运行在终端主屏（main screen），启动时若触发 [`maybeStartBackgroundDream`](../internal/cli/repl/dream_startup.go#L38-L58)，后台协程跑完后直接通过 `fmt.Fprintln(out, ...)` 往 `os.Stdout` 追加一行暗色完成摘要（`RenderReportLine`）。在主屏的普通滚动缓冲区里，这一行输出顺着 scrollback 自然滑过，完全不影响交互。
+- **TUI 的防花屏约束**：全屏 TUI 运行在 alt-screen 上，每个字符的位置都由 Bubble Tea 的 MVU 全屏重绘严格控制。如果启动后台协程直接向 stdout 异步写文本，会破坏转义序列与光标布局，造成严重的终端花屏与撕裂。
+- **架构抉择**：若要让 TUI 也感知后台 consolidation，必须将结果包装为 `tea.Msg`、通过事件桥送入通道、再在 UI 视口内渲染通知条。由于启动自动记忆整理并非交互刚需，TUI 直接在入口装配处裁减掉了 `Dream` 配置，从根源上避免异步写 stdout。
 
 ---
 
@@ -79,16 +136,16 @@ _, err = p.Run()
 
 这样设计的意图是：store 打不开或 resume 失败，应该是一个明确的启动错误，而不是进到黑屏里才发现问题。
 
-[`newRunSessionWithStore`](../internal/cli/tui/session.go#L138-L264) 装配的 [`runSession`](../internal/cli/tui/session.go#L45-L118) 覆盖：
+上面这行 `newRunSession` 只是薄包装（[L125-L131](../internal/cli/tui/session.go#L125-L131)）：先打开共享 store，再转交给 store 无关的核心 [`newRunSessionWithStore`](../internal/cli/tui/session.go#L138-L264)（拆出核心是为了让测试用临时目录的 store 驱动它）。真正的装配都在核心这边，它构造的 [`runSession`](../internal/cli/tui/session.go#L45-L118) 覆盖：
 
-| 装配物                                          | 说明                                                |
-| :---------------------------------------------- | :-------------------------------------------------- |
-| `store` / `header` / `agentCtx`                 | resume 时 `LoadEntries` 重建上下文；否则新建 header |
-| `live *cli.LiveConfig`                          | 可变的运行配置，`/model`、`/think` 切换的就是它     |
-| `reg` / `reminders` / `schedule` / `creds`      | 工具注册表、提醒、调度、凭据                        |
-| `slash *runtime.SlashRegistry`                  | 斜杠命令注册表，与 REPL 共用                        |
-| `trust` / `dispatcher` / `hookDeps` / `onEvent` | 信任管理、Hook 分发器与观察者链                     |
-| `curLeaf` / `persisted` / `compacted`           | 树状会话游标与分支落盘状态                          |
+| 装配物                                          | 说明                                                                                                      |
+| :---------------------------------------------- | :-------------------------------------------------------------------------------------------------------- |
+| `store` / `header` / `agentCtx`                 | resume 时 `LoadEntries` 重建上下文；否则新建 header                                                       |
+| `live *cli.LiveConfig`                          | 可变的运行配置，`/model`、`/think` 切换的就是它                                                           |
+| `reg` / `reminders` / `schedule` / `creds`      | 工具注册表、提醒、调度、凭据                                                                              |
+| `slash *runtime.SlashRegistry`                  | 斜杠命令注册表，与 REPL 共用（见 [SlashRegistry 专文](./斜杠命令注册表SlashRegistry与双前端共用设计.md)） |
+| `trust` / `dispatcher` / `hookDeps` / `onEvent` | 信任管理、Hook 分发器与观察者链                                                                           |
+| `curLeaf` / `persisted` / `compacted`           | 树状会话游标与分支落盘状态                                                                                |
 
 装配后 [`withSession`](../internal/cli/tui/model.go#L210-L223) 把模型的依赖**注入**进去：
 
@@ -104,7 +161,7 @@ _, err = p.Run()
 不直接在 Model 里 new 一个 session，换来两件事：
 
 - **可测**：[slash_test.go:184](../internal/cli/tui/slash_test.go#L184) 把 `startRunFn` 换成 stub，就能在不碰真 store、真 provider 的情况下验证 prompt 路径；[input_test.go:169](../internal/cli/tui/input_test.go#L169) 给 `interruptFn` 装一个记录器，就能断言 `ctrl+c` 触发了两段式中断。字段为 nil 时模型照样能构造（`NewModel` 之后不注入），所以「未注入」是一条**正常可走**的状态，不是崩溃。
-- **Model 不背状态**：`store`、`agentCtx`、`live`、`slash` 都属于 `runSession`，Model 只拿一个能调的函数引用，两者各自的所有权和生命周期因此保持干净。
+- **Model 不拥有状态**：`store`、`agentCtx`、`header`、`live`、`slash` 都归 `runSession` 所有，Model 只是**持有引用**（`m.session` / `m.live` / `m.slash`）并按需调用它的方法（`m.session.persist()`、`m.session.startRemote()`、`m.session.renderSession()`）。所有权在 `runSession`，Model 是调用方——两者的生命周期因此保持干净：程序退出后 Model 消失，会话内容已经落到 store 里。
 
 顺带把术语落到实处：**「注入」在代码层面就是一行赋值**（`m.startRunFn = s.startRun`），没有任何额外机制。之所以值得单起一个名字，是因为这行赋值同时确定了「谁拥有实现」（`runSession`）和「谁负责调用」（Model）——也正因如此，[`startPrompt`](../internal/cli/tui/model.go#L996-L1008) 里才需要 `startRunFn == nil` 这个分支（见[第七节](#七一次提交的完整生命周期)流程图中的 `startRunFn 是否已注入?`）。
 
@@ -118,6 +175,8 @@ _, err = p.Run()
 - [`Update`](../internal/cli/tui/model.go#L238-L547)：唯一的纯状态迁移入口，一个大 `type switch` 分派所有 `tea.Msg`。
 - [`View`](../internal/cli/tui/model.go#L1186-L1198)：渲染，并声明 `AltScreen: true` 与 `MouseMode: tea.MouseModeCellMotion`。
 
+MVU 三元各自的职责边界，以及 tea 运行时究竟怎么驱动它们——`Update` 与绘制是两步、`Cmd` 的真实语义是「被返回的函数」而非「被调用的函数」、`cmds` / `msgs` 为何都是无缓冲——单独成篇，见 [MVU 主循环与 tea 运行时机制设计](./MVU主循环与tea运行时机制设计.md)。
+
 ```go
 func (m Model) View() tea.View {
 	if m.quitting {
@@ -128,8 +187,31 @@ func (m Model) View() tea.View {
 }
 ```
 
+### 什么是 alt-screen（备用屏）
+
+**alt-screen 是终端模拟器内置的第二块「屏幕」。** 终端内部同时维护两块屏幕缓冲区，同一时刻只显示其中一块：
+
+| 缓冲区            | 内容                                                               | scrollback     |
+| :---------------- | :----------------------------------------------------------------- | :------------- |
+| **主屏**（main）  | 平时看到的 shell 输出、命令历史                                    | 有，可向上翻页 |
+| **备用屏**（alt） | 进入时清空的独立空白屏，全屏程序专用（vim / less / htop / 本 TUI） | 无             |
+
+切换靠转义序列，对应 terminfo 里的 `smcup` / `rmcup`：
+
+```
+进入 alt-screen:  ESC [ ? 1049 h      (smcup)
+退出 alt-screen:  ESC [ ? 1049 l      (rmcup)
+```
+
+（`1049` 是「保存光标 + 清屏 + 切换」的合并变体，等价于早期的 `1047` / `47` 加一对光标保存/恢复。）
+
+关键在于**退出时**：终端只是把显示切回主屏，主屏原有的内容**原样还在，不会被重新打印一遍**——所以退出 vim 后 shell 历史仍在原地、光标位置也没乱。这正是备用屏存在的意义：全屏程序不需要自己「清理现场」。
+
+落到本项目，这个特性有三条直接后果：
+
 - **alt-screen 靠 `View` 声明**：Bubble Tea v2 据此进入/离开备用缓冲区，所以 `Run` 干净返回时，用户进入前的 scrollback 会被原样恢复。
-- **必须开 `MouseModeCellMotion`**：alt-screen 吞掉了终端原生滚轮（没有 scrollback），只有开了 cell-motion 才会收到滚轮/点击/释放事件，transcript 的滚轮滚动、滚动条拖拽、鼠标框选才成立。
+- **必须开 `MouseModeCellMotion`**：alt-screen 吞掉了终端原生滚轮（没有 scrollback），只有开了 cell-motion 才会收到滚轮/点击/释放事件，transcript 的滚轮滚动、滚动条拖拽、鼠标框选才成立——本项目的滚动完全是自实现的，见[第九节](#九布局是减法relayout-与渲染分层)。
+- **每帧整屏重绘**：备用屏上没有任何遗留内容可以依赖，`View` 每帧返回完整界面，而不是增量输出。
 
 ---
 
@@ -149,7 +231,7 @@ sequenceDiagram
     P->>R: StartRun + DrainStream
     R-->>P: AgentEvent / text / tool
     P->>M: ch <- tea.Msg（满则阻塞 = 背压）
-    P->>M: runEndMsg
+    P->>M: ch <- runEndMsg（收尾哨兵：最后一条，同一条 channel）
     M-->>U: Update → View 重绘
 ```
 
@@ -192,7 +274,19 @@ func startRun(ctx context.Context, agentCtx *agentcore.AgentContext, cfg runtime
 | `TelemetryEvent`                           | `telemetryMsg`                            |
 | `CompactionStartEvent` / `CompactionEvent` | `compactionStartMsg` / `compactionMsg`    |
 
-两个顺序细节值得留意：一是 `OnEvent` **先**把事件交给 `extra(ev)`（观察者链上的插件通知器与 SessionEnd/PreCompact hook），**再**翻译成 TUI 消息，hook 看到的顺序因此与屏幕渲染顺序一致；二是所有 `ch <-` 都是阻塞发送，回调这一层本身没有任何缓冲或异步——缓冲只存在于 channel 里。
+两个顺序细节值得留意，它们合起来决定了「屏幕渲染的顺序」与「hook 观察到的顺序」为何一致。
+
+**一是 `OnEvent` 里 `extra(ev)` 排在翻译之前。** [`OnEvent`](../internal/cli/tui/bridge.go#L51-L57) 干的第一件事是把事件交给 `extra`（观察者链上的插件通知器与 SessionEnd/PreCompact hook），等它返回才进 `type switch` 翻译成 `tea.Msg` 并 `ch <-`。同一顺序在更外一层也成立：[`DrainStream`](../internal/runtime/render.go#L55-L59) 也是先 `h.OnEvent(ev)`、再按事件类型分发 `OnText` / `OnTurnEnd`；所以不论一条事件最终变成哪条消息（文本增量、回合收尾、结构化事件都一样），hook 都先于它衍生出的那条消息跑完。
+
+**再叠上「只有一个生产者」这个前提，保序才成立。** `DrainStream` 就是一个跑在 pump goroutine 上的 `for ev := range stream.Events()` 循环，上一轮回调不返回、下一轮不会开始；hook 序列与入队序列因此各自严格等于事件到达顺序，而 channel 是 FIFO、消费者又只有 tea 主循环一个，于是**渲染顺序 = 入队顺序 = 事件顺序**。这两条合起来给出一个不变量，对每一条事件 e 都成立：
+
+```text
+extra(e)  →  ch <- msg(e)  →  渲染 e         （前两者同一个 goroutine，第三者异步）
+```
+
+反过来说，若把顺序颠倒（先 `ch <-` 再 `extra(ev)`），64 的缓冲让 `ch <-` 通常立即返回，tea goroutine 完全可能已经把 `msg(e₁)` 取走并渲染完，而 `extra(e₁)` 还没跑——插件通知（写 stderr）与 hook 的落盘/告警就会落后于它本该对应的那次屏幕更新。注意这是**顺序**保证而非**同时**保证：渲染本身是异步的，`extra(e₂)` 并不保证晚于 `render(e₁)`。
+
+**二是所有 `ch <-` 都是阻塞发送**，回调这一层本身没有任何缓冲或异步——缓冲只存在于 channel 里。也就是说，「排队」只发生在 channel 上，回调里的每一次 send 都是同步的：满了就卡住生产者（背压，见后文「四个性质」），但绝不丢弃、绝不覆盖。
 
 **泵：`pump` 是「一次 run 一条 goroutine」。**
 
@@ -214,26 +308,42 @@ func waitForEvent(ch chan tea.Msg) tea.Cmd {
 }
 ```
 
-它是 `tea.Cmd`，Bubble Tea 会把它放到**自己的 goroutine** 上执行，所以 `<-ch` 阻塞的是那条命令 goroutine，**不会卡住 `Update`**；消息一到，tea 运行时把返回值送回主循环，触发一次 `Update`。
+它是 `tea.Cmd`，Bubble Tea 会把它放到**自己的 goroutine** 上执行，所以 `<-ch` 阻塞的是那条命令 goroutine，**不会卡住 `Update`**；消息一到，tea 运行时把返回值送回主循环，触发一次 `Update`。（这条机制的源码依据见 [MVU 主循环与 tea 运行时机制设计 § 三](./MVU主循环与tea运行时机制设计.md#三cmd-是被返回的函数)。）
 
-真正的节奏感来自 `Update` 里的**续期（re-arm）协议**：每一个消费桥消息的 case 都以 `return m, m.pumpNext()` 结尾——`textDeltaMsg`、`turnEndMsg`、`toolStartMsg`、`toolUpdateMsg`、`subagentProgressMsg`、`toolEndMsg`、`telemetryMsg`、`compactionStartMsg`、`compactionMsg`、`runEndMsg` 无一例外。于是「处理一条 → 立刻再挂一条」，channel 被一条条拉空：
+真正的节奏感来自 `Update` 里的**续期（re-arm）协议**：除收尾的 `runEndMsg` 外，其余 9 个消费桥消息的 case 都以 `return m, m.pumpNext()` 结尾——`textDeltaMsg`、`turnEndMsg`、`toolStartMsg`、`toolUpdateMsg`、`subagentProgressMsg`、`toolEndMsg`、`telemetryMsg`、`compactionStartMsg`、`compactionMsg`，共 9 处，全在 [`Update`](../internal/cli/tui/model.go#L238) 的 switch 里。于是「处理一条 → 立刻再挂一条」，channel 被一条条拉空：
 
 ```go
 func (m Model) pumpNext() tea.Cmd {
 	if m.running && m.runCh != nil {
 		return waitForEvent(m.runCh)   // 还在跑：续一条
 	}
-	return nil                          // runEndMsg 已清空 runCh：自然停摆
+	return nil                          // 兜底：已无在途 run，不续期
 }
 ```
 
-`runEndMsg` 的处理里会先 `m.running = false`、`m.runCh = nil`，所以它结尾那句 `m.pumpNext()` 必然返回 `nil`——泵的终止不需要任何额外信号，它是「条件不成立」的自然结果。
+它的调用点全部落在同一个 switch 里，每个桥消息 case 各一处：
+
+| 桥消息                | `case` 行                                 | 续期语句                                  |
+| :-------------------- | :---------------------------------------- | :---------------------------------------- |
+| `textDeltaMsg`        | [L349](../internal/cli/tui/model.go#L349) | [L353](../internal/cli/tui/model.go#L353) |
+| `turnEndMsg`          | [L355](../internal/cli/tui/model.go#L355) | [L382](../internal/cli/tui/model.go#L382) |
+| `toolStartMsg`        | [L384](../internal/cli/tui/model.go#L384) | [L399](../internal/cli/tui/model.go#L399) |
+| `toolUpdateMsg`       | [L401](../internal/cli/tui/model.go#L401) | [L412](../internal/cli/tui/model.go#L412) |
+| `subagentProgressMsg` | [L414](../internal/cli/tui/model.go#L414) | [L420](../internal/cli/tui/model.go#L420) |
+| `toolEndMsg`          | [L422](../internal/cli/tui/model.go#L422) | [L448](../internal/cli/tui/model.go#L448) |
+| `telemetryMsg`        | [L450](../internal/cli/tui/model.go#L450) | [L462](../internal/cli/tui/model.go#L462) |
+| `compactionStartMsg`  | [L464](../internal/cli/tui/model.go#L464) | [L466](../internal/cli/tui/model.go#L466) |
+| `compactionMsg`       | [L468](../internal/cli/tui/model.go#L468) | [L474](../internal/cli/tui/model.go#L474) |
+
+这 9 处形态完全一致：先迁移自己的 UI 状态，最后一句 `return m, m.pumpNext()`。也就是说续期不是某个 case 的特例，而是「凡是从 channel 取走一条消息，就补挂一条」的固定收尾——**只要这条消息进了 switch，续期就必然发生在 tea goroutine 上**，`m.running` / `m.runCh` 的读写因此不需要任何锁。
+
+`runEndMsg` 是唯一的例外：它先 `m.running = false`、`m.runCh = nil`，然后直接 `return m, tea.Batch(focus, fetchGitCmd(m.cwd))`——**不再续期**。泵的终止不需要任何额外信号，就是这条 case 之后无人再挂 `waitForEvent`；`pumpNext` 里那句 `return nil` 只是防御性兜底，正常路径走不到。
 
 这四步叠在一起，同时拿到了四个性质：
 
 - **保序**：生产者只有一个（pump goroutine 串行执行 `DrainStream` 的回调），channel 是 FIFO，消费者也只有一个（tea 主循环一次只处理一条 `tea.Msg`）；三者叠加使「事件发生顺序 = 屏幕渲染顺序」。
 - **不丢**：`ch <-` 是阻塞发送，缓冲写满就阻塞生产者，背压一路传导回 provider 的流——`eventChanCap = 64` 只是让一段工具事件突发能先排进队列、不必每次 send 都等消费者，**绝不丢弃、绝不覆盖**。
-- **不空转**：`waitForEvent` 只在有在途 run 时被挂上；run 结束后 `pumpNext` 返回 `nil`，tea 循环保持空闲，没有任何轮询。
+- **不空转**：`waitForEvent` 只在有在途 run 时被挂上；`runEndMsg` 之后无人再续期，tea 循环保持空闲，没有任何轮询。
 - **无竞态**：所有 `m.*` 状态迁移都发生在 tea goroutine，pump 只碰 `agentCtx` 和 channel；所以 `runEndMsg` 里 `persist()` 可以放心读 `Messages`——`DrainStream` 已返回，再无人写。
 
 还有一个容错细节：**`argsToMap`**（[bridge.go](../internal/cli/tui/bridge.go#L83-L95)）把工具调用参数的 `Args` 从事件层的 `any` 收敛成 `map[string]any`——它可能是 `json.RawMessage`、`[]byte`、已解码的 `map`，甚至 `string`，非 JSON 对象一律返回 `nil`，保证工具卡片不会因为参数形态不同而崩。
